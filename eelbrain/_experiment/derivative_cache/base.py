@@ -48,13 +48,15 @@ Garbage collection
 
 Stale artifacts left behind by changed definitions or removed nodes are found
 and removed by :mod:`.garbage_collection`; the entry points are
-:meth:`DerivativeRegistry.scan_cache` and :meth:`DerivativeRegistry.collect`.
+:meth:`DerivativeRegistry.scan_cache` and
+:meth:`~eelbrain._experiment.derivative_cache.garbage_collection.GCReport.collect`.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 import hashlib
@@ -350,12 +352,11 @@ def _cache_entity_dir(key: dict[str, Any]) -> Path:
     return Path(*(CACHE_PATH_UNSAFE.sub(CACHE_PATH_UNSAFE_REPLACEMENT, part) for part in parts))
 
 
-def _cache_disambiguation_path(path: str | Path) -> Path:
-    return Path(f"{Path(path)}{CACHE_DISAMBIGUATION_SUFFIX}")
+def _cache_disambiguation_path(path: Path) -> Path:
+    return Path(f"{path}{CACHE_DISAMBIGUATION_SUFFIX}")
 
 
-def _disambiguated_cache_artifact_path(path: str | Path, suffix: str) -> Path:
-    path = Path(path)
+def _disambiguated_cache_artifact_path(path: Path, suffix: str) -> Path:
     if path.suffix:
         return path.with_name(f"{path.stem}{suffix}{path.suffix}")
     return path.with_name(f"{path.name}{suffix}")
@@ -604,7 +605,12 @@ class DependencyNode(Generic[T]):
         return None
 
     def path(self, ctx: Request) -> Path:
-        """Path to the artifact."""
+        """Path to the artifact.
+
+        Should be built from ``ctx.root`` or ``ctx.registry.cache_dir``, so
+        that it shares the root's spelling (see
+        :meth:`DerivativeRegistry.is_cache_artifact`).
+        """
         raise NotImplementedError
 
     def load_view(
@@ -1164,8 +1170,9 @@ class Request(Generic[T]):
     Notes
     -----
     Derivative-only members such as :meth:`key`, :attr:`artifact_path`,
-    :attr:`manifest_path`, and :meth:`is_valid` are available on the same
-    object. They raise :class:`TypeError` when the request targets an input.
+    :attr:`manifest_path`, :meth:`is_valid`, and :meth:`ensure` are available
+    on the same object. They raise :class:`TypeError` when the request targets
+    an input.
     """
 
     def __init__(
@@ -1224,9 +1231,9 @@ class Request(Generic[T]):
             # only became canonical through the manifest JSON round-trip would
             # never equal its stored form and silently recompute on every run.
             self._key = registry.canonicalize(node.key(self))
-            self._base_artifact_path = Path(node.path(self))
-            self._artifact_path = Path(self.registry.resolve_cache_artifact_path(self._base_artifact_path, self._key))
-            self._manifest_path = Path(self.registry.manifest_path(self._artifact_path, self.node.name))
+            self._base_artifact_path = node.path(self)
+            self._artifact_path = self.registry.resolve_cache_artifact_path(self._base_artifact_path, self._key)
+            self._manifest_path = self.registry.manifest_path(self._artifact_path, self.node.name)
             self._warn_inert_key_options()
 
     def _warn_inert_key_options(self) -> None:
@@ -1484,7 +1491,7 @@ class Request(Generic[T]):
         manifest = self._manifest()
         if manifest is None or not self.artifact_path.exists():
             return False
-        return self._check_valid(manifest) is None
+        return self.registry._validation_reason(self, manifest) is None
 
     def _dependency_map(self) -> dict[str, Dependency]:
         """Declared dependencies keyed by label, rejecting duplicate labels."""
@@ -1520,7 +1527,7 @@ class Request(Generic[T]):
             elif not artifact_exists:
                 reason = CacheInvalidation('missing_artifact')
             else:
-                reason = self._check_valid(manifest)
+                reason = self.registry._validation_reason(self, manifest)
             if manifest is not None and artifact_exists and reason is None:
                 self._artifact_metadata = manifest.artifact_metadata
                 derivative.log_cache_hit(self, self.artifact_path)
@@ -1568,6 +1575,7 @@ class Request(Generic[T]):
             resolve_options=resolve_options,
         )
         self.registry.write_manifest(self.manifest_path, manifest)
+        self.registry._record_valid(self)
         self._artifact_metadata = manifest.artifact_metadata
         return derivative.load(self, self.artifact_path)
 
@@ -1616,27 +1624,59 @@ class Request(Generic[T]):
         ``view`` is accepted; passing ``state``, ``options``, or ``controls``
         raises :class:`TypeError`.
         """
+        with self.registry._load_context():
+            return self._load(name, state, options, view=view, controls=controls)
+
+    def _resolve_target(
+            self,
+            name: str,
+            state: dict[str, Any] | None,
+            options: dict[str, Any] | None,
+            controls: frozenset[str] | set[str] | tuple[str, ...],
+            view: str | None,
+            caller: str,  # Method name for error messages ('load' or 'ensure').
+    ) -> tuple[Request, str | None]:
+        """Resolve a named dependency to its request and the view to apply to it.
+
+        Inside :meth:`Derivative.build` the target must be a declared
+        dependency and its view, state, and options come from that
+        :class:`Dependency` rather than from the call site; outside a build the
+        caller supplies them.
+        """
+        if self._build_deps is not None:
+            if name not in self._build_deps:
+                declared = sorted(self._build_deps)
+                raise RuntimeError(f"{self.node.name!r} called ctx.{caller}({name!r}) which is not a declared dependency. Declared: {declared}")
+            if view is not None or state is not None or options is not None or controls:
+                raise TypeError(f"{self.node.name!r} passed overrides to ctx.{caller}({name!r}); declare view, state, and options on the Dependency instead, and do not override controls here")
+            dep = self._build_deps[name]
+            child = self.registry.resolve(
+                name=dep.name,
+                state={**self._state, **dep.state} if dep.state else self._state,
+                options=dep.options,
+            )
+            self.registry._check_edge_key_coverage(self, dep, child)
+            return child, dep.view
+        child = self.registry.resolve(
+            name,
+            state={**self._state, **(state or {})},
+            options=options,
+            controls=controls,
+        )
+        return child, view
+
+    def _load(
+            self,
+            name: str | None = None,
+            state: dict[str, Any] | None = None,
+            options: dict[str, Any] | None = None,
+            *,
+            view: str | None = None,
+            controls: frozenset[str] | set[str] | tuple[str, ...] = (),
+    ):
         if isinstance(name, str):
-            if self._build_deps is not None:
-                if name not in self._build_deps:
-                    declared = sorted(self._build_deps)
-                    raise RuntimeError(f"{self.node.name!r} called ctx.load({name!r}) which is not a declared dependency. Declared: {declared}")
-                if view is not None or state is not None or options is not None or controls:
-                    raise TypeError(f"{self.node.name!r} passed overrides to ctx.load({name!r}); declare view, state, and options on the Dependency instead, and do not override controls here")
-                dep = self._build_deps[name]
-                child = self.registry.resolve(
-                    name=dep.name,
-                    state={**self._state, **dep.state} if dep.state else self._state,
-                    options=dep.options,
-                )
-                self.registry._check_edge_key_coverage(self, dep, child)
-                return child.load(view=dep.view)
-            return self.registry.resolve(
-                name,
-                state={**self._state, **(state or {})},
-                options=options,
-                controls=controls,
-            ).load(view=view)
+            child, child_view = self._resolve_target(name, state, options, controls, view, 'load')
+            return child.load(view=child_view)
 
         if state is not None or options is not None or controls:
             raise TypeError("Request.load() without a dependency name only accepts a view override")
@@ -1651,6 +1691,67 @@ class Request(Generic[T]):
         with self._build_deps_context():
             artifact = self.load_artifact()
             return derivative.apply_view_options(self, artifact)
+
+    def ensure(
+            self,
+            name: str | None = None,
+            state: dict[str, Any] | None = None,
+            options: dict[str, Any] | None = None,
+            *,
+            controls: frozenset[str] | set[str] | tuple[str, ...] = (),
+    ) -> None:
+        """Make sure this request's artifact exists, without loading its value.
+
+        Use this instead of discarding the result of :meth:`load` when only the
+        artifact on disk is needed, for example when handing its path to an
+        external tool. A valid artifact is left untouched, so unlike
+        :meth:`load` this does not pay :meth:`Derivative.load` on a cache hit.
+
+        Parameters
+        ----------
+        name
+            Registered node name to ensure as a dependency. When omitted or
+            ``None``, the current request itself is materialized.
+        state
+            State overrides merged on top of the current request's state
+            before resolving the dependency. Only valid when ``name`` is
+            given.
+        options
+            Option overrides for the target node. Only valid when ``name`` is
+            given.
+        controls
+            Explicit execution controls forwarded to the nested request. Only
+            valid when ``name`` is given.
+
+        Notes
+        -----
+        This is a derivative-only operation; it raises :class:`TypeError` when
+        the target is an :class:`Input`, which has no artifact to materialize.
+        Views are irrelevant here and are ignored: they shape a loaded value,
+        not the artifact this builds.
+        """
+        with self.registry._load_context():
+            self._ensure(name, state, options, controls=controls)
+
+    def _ensure(
+            self,
+            name: str | None = None,
+            state: dict[str, Any] | None = None,
+            options: dict[str, Any] | None = None,
+            *,
+            controls: frozenset[str] | set[str] | tuple[str, ...] = (),
+    ) -> None:
+        if isinstance(name, str):
+            child, _ = self._resolve_target(name, state, options, controls, None, 'ensure')
+            child._ensure()
+            return
+
+        if state is not None or options is not None or controls:
+            raise TypeError("Request.ensure() without a dependency name takes no overrides")
+        if self.is_valid():
+            return
+        with self._build_deps_context():
+            self.load_artifact()
 
 
 class DerivativeRegistry:
@@ -1667,6 +1768,40 @@ class DerivativeRegistry:
         # refresh, no disambiguation sidecars, no VersionedInput references).
         # Set by _readonly_context() during a garbage-collection scan.
         self._readonly = False
+        # Reuse cache-validity results within one top-level Request.load().
+        # Artifacts themselves are not shared because callers can mutate them.
+        self._validation_cache: ContextVar[dict[tuple[str, str], CacheInvalidation | None] | None] = ContextVar(f'{type(self).__name__}-{id(self)}-validation-cache', default=None)
+
+    @contextmanager
+    def _load_context(self):
+        """Share cache-validity results across one nested request load."""
+        if self._validation_cache.get() is not None:
+            yield
+            return
+        token = self._validation_cache.set({})
+        try:
+            yield
+        finally:
+            self._validation_cache.reset(token)
+
+    @staticmethod
+    def _validation_key(ctx: Request) -> tuple[str, str]:
+        return ctx.node.name, _full_cache_key_digest(ctx.key())
+
+    def _validation_reason(self, ctx: Request, manifest: ArtifactManifest) -> CacheInvalidation | None:
+        """Validate once per artifact during a nested request load."""
+        cache = self._validation_cache.get()
+        if cache is None:
+            return ctx._check_valid(manifest)
+        key = self._validation_key(ctx)
+        if key not in cache:
+            cache[key] = ctx._check_valid(manifest)
+        return cache[key]
+
+    def _record_valid(self, ctx: Request) -> None:
+        """Record a manifest written during the current load as valid."""
+        if (cache := self._validation_cache.get()) is not None:
+            cache[self._validation_key(ctx)] = None
 
     @contextmanager
     def _readonly_context(self):
@@ -1771,7 +1906,7 @@ class DerivativeRegistry:
         except ValueError:
             return str(artifact_path)
 
-    def _read_cache_disambiguation(self, path: str | Path) -> dict[str, str]:
+    def _read_cache_disambiguation(self, path: Path) -> dict[str, str]:
         sidecar_path = _cache_disambiguation_path(path)
         if not sidecar_path.exists():
             return {}
@@ -1784,17 +1919,16 @@ class DerivativeRegistry:
             return {}
         return {str(key): value for key, value in data.items() if isinstance(value, str)}
 
-    def _write_cache_disambiguation(self, path: str | Path, data: dict[str, str]) -> None:
+    def _write_cache_disambiguation(self, path: Path, data: dict[str, str]) -> None:
         sidecar_path = _cache_disambiguation_path(path)
         sidecar_path.parent.mkdir(parents=True, exist_ok=True)
         _atomic_write_text(sidecar_path, json.dumps(data, sort_keys=True, indent=2))
 
     def resolve_cache_artifact_path(
             self,
-            path: str | Path,
+            artifact_path: Path,
             key: dict[str, Any],  # Canonical derivative key (see Request.key()).
     ) -> Path:
-        artifact_path = Path(path)
         if not self.is_cache_artifact(artifact_path):
             return artifact_path
 
@@ -2015,15 +2149,8 @@ class DerivativeRegistry:
         append_node(root, None, '', True)
         return '\n'.join(lines)
 
-    def is_cache_artifact(self, path: str | Path) -> bool:
-        cache_dir = self.cache_dir.resolve()
-        artifact_path = Path(path).resolve()
-        try:
-            artifact_path.relative_to(cache_dir)
-        except ValueError:
-            return False
-        else:
-            return True
+    def is_cache_artifact(self, path: Path) -> bool:
+        return path.is_relative_to(self.cache_dir)
 
     def manifest_path(self, artifact_path: Path, node_name: str | None = None) -> Path:
         if self.is_cache_artifact(artifact_path):
@@ -2072,8 +2199,6 @@ class DerivativeRegistry:
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
         _atomic_write_text(manifest_path, json.dumps(manifest.to_dict(), sort_keys=True, indent=2))
 
-    # --- Garbage collection -------------------------------------------------
-
     def scan_cache(self, revalidate: bool = True) -> GCReport:
         """Classify every file in the cache directory without modifying anything.
 
@@ -2087,31 +2212,10 @@ class DerivativeRegistry:
 
         See Also
         --------
-        collect : delete the files a scan flags
+        GCReport.collect : delete the files a scan flags
         """
         from .garbage_collection import scan_cache
         return scan_cache(self, revalidate)
-
-    def collect(
-            self,
-            report: GCReport | None = None,
-            revalidate: bool = True,
-    ) -> GCReport:
-        """Delete the cache files flagged by a garbage-collection scan.
-
-        Parameters
-        ----------
-        report
-            Scan result to act on; scans first when omitted.
-        revalidate
-            Passed to :meth:`scan_cache` when scanning here.
-
-        See Also
-        --------
-        scan_cache : the scan and the classification categories
-        """
-        from .garbage_collection import collect
-        return collect(self, report, revalidate)
 
     @staticmethod
     def canonicalize(value: Any) -> Any:

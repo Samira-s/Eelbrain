@@ -538,8 +538,8 @@ class ProtectedDerivative(Derivative[str]):
     def __init__(self, root: str | Path):
         self.root = Path(root)
 
-    def path(self, ctx: Request) -> str:
-        return str(self.root / 'derivatives' / 'mne' / ctx.state['subject'] / 'protected.txt')
+    def path(self, ctx: Request) -> Path:
+        return self.root / 'derivatives' / 'mne' / ctx.state['subject'] / 'protected.txt'
 
     def dependencies(self, ctx: Request) -> tuple[Dependency, ...]:
         return (Dependency('source'),)
@@ -679,6 +679,79 @@ def test_registry_load_caches_derivative_and_writes_manifest():
 
     assert first == second == 'alpha'
     assert value.build_calls == 1
+
+
+def test_nested_load_reuses_cached_derivative_validation():
+    """Repeated artifact loads share validation work, but not loaded values."""
+    root, registry = make_empty_registry()
+
+    class CountingSource(Input[str]):
+        name = 'counting-source'
+        key_fields = ()
+
+        def __init__(self):
+            self.fingerprint_calls = 0
+            self.source_path = Path(root) / 'source.txt'
+
+        def path(self, ctx: Request) -> Path:
+            return self.source_path
+
+        def fingerprint(self, ctx: Request) -> dict[str, str]:
+            self.fingerprint_calls += 1
+            return {'value': self.source_path.read_text()}
+
+        def load(self, ctx: Request) -> str:
+            return self.source_path.read_text()
+
+    class SharedDerivative(Derivative[str]):
+        name = 'shared'
+        key_fields = ()
+        cache_suffix = '.txt'
+
+        def __init__(self):
+            self.load_calls = 0
+
+        def dependencies(self, ctx: Request) -> tuple[Dependency, ...]:
+            return (Dependency('counting-source'),)
+
+        def build(self, ctx: Request) -> str:
+            return ctx.load('counting-source')
+
+        def load(self, ctx: Request, path: Path) -> str:
+            self.load_calls += 1
+            return path.read_text()
+
+        def save(self, ctx: Request, path: Path, value: str) -> None:
+            path.write_text(value)
+
+    class PairDerivative(UncachedDerivative[tuple[str, str]]):
+        name = 'pair'
+        key_fields = ()
+
+        def dependencies(self, ctx: Request) -> tuple[Dependency, ...]:
+            return Dependency('shared', label='first'), Dependency('shared', label='second')
+
+        def build(self, ctx: Request) -> tuple[str, str]:
+            return ctx.load('first'), ctx.load('second')
+
+    source = CountingSource()
+    shared = SharedDerivative()
+    registry.register(source)
+    registry.register(shared)
+    registry.register(PairDerivative())
+    source.source_path.write_text('alpha')
+    registry.resolve('shared').load()  # warm the cache
+
+    source.fingerprint_calls = 0
+    shared.load_calls = 0
+    assert registry.resolve('pair').load() == ('alpha', 'alpha')
+    assert source.fingerprint_calls == 1
+    assert shared.load_calls == 2  # mutable loaded values are not shared
+
+    # The validation result is scoped to one top-level load: a later source
+    # change still invalidates and rebuilds the shared derivative.
+    source.source_path.write_text('beta')
+    assert registry.resolve('pair').load() == ('beta', 'beta')
 
 
 def test_restricted_state_get_is_checked():
@@ -1722,7 +1795,7 @@ def test_gc_clean_cache_is_empty():
     assert report.errors == []
     assert report.scanned_manifests == 2
     # collect on a clean cache is a no-op
-    registry.collect(report)
+    report.collect()
     assert registry.resolve('downstream', state=DEFAULT_STATE).is_valid()
 
 
@@ -1737,7 +1810,8 @@ def test_gc_dead_node_dir():
     entry = _single_entry(report, GCCategory.DEAD_NODE_DIR)
     assert entry.path == ghost_dir
     assert entry.size > 0
-    registry.collect(report)
+    assert report.registry is registry
+    report.collect()
     assert not ghost_dir.exists()
     assert ctx.artifact_path.exists()
 
@@ -1752,7 +1826,7 @@ def test_gc_schema_mismatch():
     report = registry.scan_cache()
     entry = _single_entry(report, GCCategory.SCHEMA)
     assert entry.path == ctx.artifact_path
-    registry.collect(report)
+    report.collect()
     assert not ctx.artifact_path.exists()
     assert not ctx.manifest_path.exists()
     assert not (registry.cache_dir / 'configured').exists()  # emptied dirs are pruned
@@ -1765,7 +1839,7 @@ def test_gc_derivative_version_mismatch():
     configured.version = 2
     report = registry.scan_cache()
     _single_entry(report, GCCategory.DERIVATIVE_VERSION)
-    registry.collect(report)
+    report.collect()
     assert not ctx.artifact_path.exists()
 
 
@@ -1777,7 +1851,7 @@ def test_gc_orphan_manifest():
     report = registry.scan_cache()
     entry = _single_entry(report, GCCategory.ORPHAN_MANIFEST)
     assert entry.path == ctx.manifest_path
-    registry.collect(report)
+    report.collect()
     assert not ctx.manifest_path.exists()
 
 
@@ -1789,14 +1863,14 @@ def test_gc_external_mirror():
     # the mirror manifest of a live external artifact is preserved silently
     report = registry.scan_cache()
     assert report.entries == []
-    registry.collect(report)
+    report.collect()
     assert ctx.manifest_path.exists()
     # once the external artifact is gone, the mirror is dead weight
     Path(ctx.artifact_path).unlink()
     report = registry.scan_cache()
     entry = _single_entry(report, GCCategory.ORPHAN_MIRROR)
     assert entry.path == ctx.manifest_path
-    registry.collect(report)
+    report.collect()
     assert not ctx.manifest_path.exists()
 
 
@@ -1809,7 +1883,7 @@ def test_gc_superseded_key():
     report = registry.scan_cache()
     entry = _single_entry(report, GCCategory.SUPERSEDED_KEY)
     assert entry.path == old_artifact
-    registry.collect(report)
+    report.collect()
     assert not old_artifact.exists()
     assert registry.resolve('configured', state=DEFAULT_STATE).load() == 'configured:a'
 
@@ -1822,7 +1896,7 @@ def test_gc_added_key_field_is_unverifiable():
     report = registry.scan_cache()
     _single_entry(report, GCCategory.UNVERIFIABLE)
     assert report.errors
-    registry.collect(report)
+    report.collect()
     assert ctx.artifact_path.exists()  # unverifiable files are never deleted
 
 
@@ -1835,7 +1909,7 @@ def test_gc_revalidation_stale():
     report = registry.scan_cache()
     entry = _single_entry(report, GCCategory.REVALIDATION_STALE)
     assert 'fingerprint' in entry.reason
-    registry.collect(report)
+    report.collect()
     assert not ctx.artifact_path.exists()
     assert registry.resolve('configured', state=DEFAULT_STATE).load() == 'configured:b'
 
@@ -1852,7 +1926,7 @@ def test_gc_stale_dependency_propagation():
     entry = _single_entry(report, GCCategory.STALE_DEPENDENCY)
     assert entry.path == downstream_ctx.artifact_path
     assert 'configured' in entry.reason
-    registry.collect(report)
+    report.collect()
     assert not downstream_ctx.artifact_path.exists()
     assert not downstream_ctx.manifest_path.exists()
 
@@ -1867,7 +1941,7 @@ def test_gc_stale_dependency_after_child_rebuild():
     report = registry.scan_cache()
     entry = _single_entry(report, GCCategory.STALE_DEPENDENCY)
     assert entry.path == downstream_ctx.artifact_path
-    registry.collect(report)
+    report.collect()
     assert not downstream_ctx.artifact_path.exists()
     assert registry.resolve('configured', state=DEFAULT_STATE).is_valid()
 
@@ -1885,7 +1959,7 @@ def test_gc_directory_artifact():
     report = registry.scan_cache()
     entry = _single_entry(report, GCCategory.REVALIDATION_STALE)
     assert entry.path == ctx.artifact_path
-    registry.collect(report)
+    report.collect()
     assert not ctx.artifact_path.exists()
 
 
@@ -1904,7 +1978,7 @@ def test_gc_stale_versioned_reference():
     report = registry.scan_cache()
     entry = _single_entry(report, GCCategory.STALE_REFERENCE)
     assert entry.path == reference_dir / 'ref.0.pickle'
-    registry.collect(report)
+    report.collect()
     assert not (reference_dir / 'ref.0.pickle').exists()
     assert (reference_dir / 'ref.json').exists()
     assert (reference_dir / 'ref.1.pickle').exists()
@@ -1927,7 +2001,7 @@ def test_gc_tmp_and_unknown_files():
     assert str(stray_file.relative_to(registry.cache_dir)) in file_table
     assert 'tmp' in file_table
     assert 'unknown' in file_table
-    registry.collect(report)
+    report.collect()
     assert not tmp_file.exists()
     assert stray_file.exists()  # unknown files are never deleted
 
@@ -1949,7 +2023,7 @@ def test_gc_disambiguation_pruning():
     report = registry.scan_cache()
     entry = _single_entry(report, GCCategory.STALE_DISAMBIGUATION)
     assert len(entry.prune_digests) == 1
-    registry.collect(report)
+    report.collect()
     assert not sidecar_path.exists()  # last entry pruned → sidecar removed
     assert base_ctx.artifact_path.exists()
 
@@ -1981,7 +2055,7 @@ def test_gc_unverifiable_manifest_backfilled_on_use():
     report = registry.scan_cache()
     entry = _single_entry(report, GCCategory.UNVERIFIABLE)
     assert 'predates' in entry.reason
-    registry.collect(report)
+    report.collect()
     assert ctx.artifact_path.exists()
     # a cache hit backfills the resolve context without rebuilding
     assert registry.resolve('configured', state=DEFAULT_STATE).load() == 'configured:a'
@@ -2018,7 +2092,7 @@ def test_gc_collect_logs_deletions(caplog):
     configured.config = 'b'
     report = registry.scan_cache()
     with caplog.at_level(logging.DEBUG, logger=LOG.name):
-        registry.collect(report)
+        report.collect()
     debug_messages = [record.message for record in caplog.records if record.levelno == logging.DEBUG]
     assert any('Cache GC: removed' in message and 'revalidation_stale' in message for message in debug_messages)
     info_messages = [record.message for record in caplog.records if record.levelno == logging.INFO]
