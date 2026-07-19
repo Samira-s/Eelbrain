@@ -1,15 +1,21 @@
 # Author: Christian Brodbeck <christianbrodbeck@nyu.edu>
+import mne
+import numpy as np
 import pytest
 
 from eelbrain._exceptions import ConfigurationError
 from eelbrain._experiment.epochs import assemble_epochs
-from eelbrain._data_obj import Dataset, Var
+from eelbrain._experiment.epochs.nodes import _epochs_artifact_metadata, _load_epochs, _save_epochs
+from eelbrain._experiment.events import _combine_event_datasets
+from eelbrain._data_obj import Datalist, Dataset, Factor, Var
 from eelbrain.pipeline import PrimaryEpoch, SecondaryEpoch, SuperEpoch, EpochCollection, ContinuousEpoch
 
 
 def test_prepare_continuous_epoch_dataset():
-    epoch = ContinuousEpoch('task', 'stim == 1', pad_start=0.1, pad_end=0.2, split=0.5, samplingrate=200)
+    epoch = ContinuousEpoch('task', 'stim == 1', pad_start=0.1, pad_end=0.2, split=0.5, samplingrate=200, run='2')
     assert 'name' not in epoch._as_dict()
+    assert epoch.run == '2'
+    assert epoch._as_dict()['run'] == '2'
     ds = Dataset({
         'onset': Var([0.0, 0.1, 0.2, 1.0, 1.1]),
         'sample': Var([0, 100, 200, 1000, 1100]),
@@ -33,7 +39,40 @@ def test_prepare_continuous_epoch_dataset():
     assert tstop is None
     assert decim == 5
     assert variable_tmax is True
-    assert 'T_relative' in ds[0, 'events']
+    assert list(ds['epoch_time']) == pytest.approx([0.0, 1.0])
+    assert list(ds[0, 'events']['epoch_time']) == pytest.approx([0.0, 0.1, 0.2])
+    assert list(ds[1, 'events']['epoch_time']) == pytest.approx([1.0, 1.1])
+
+
+def test_combine_event_dataset_bids_entities():
+    "Varying BIDS entities become columns; invariant entities remain in info"
+    info = {'subject': 'R0001', 'session': '', 'acquisition': ''}
+    ds_1 = Dataset({'value': Var([1, 2])}, info={**info, 'task': 'story', 'run': '1'})
+    ds_2 = Dataset({'value': Var([3]), 'run': Factor(['2'])}, info={**info, 'task': 'rest', 'run': '2'})
+    ds = _combine_event_datasets([ds_1, ds_2])
+
+    assert tuple(ds['task']) == ('story', 'story', 'rest')
+    assert tuple(ds['run']) == ('1', '1', '2')
+    assert 'task' not in ds.info
+    assert 'run' not in ds.info
+    assert all(ds.info[key] == value for key, value in info.items())
+
+
+def test_shifted_epoch_time_serialization(tmp_path):
+    "Shifted MNE epoch time axes survive the recording-epochs cache."
+    info = mne.create_info(['EEG 001'], 100, 'eeg')
+    data = np.zeros((1, 1, 50))
+    epochs_0 = mne.EpochsArray(data, info, tmin=-0.1, verbose=False)
+    epochs_1 = mne.EpochsArray(data, info, tmin=-0.1, verbose=False).shift_time(2.0)
+    epochs = Datalist([epochs_0, epochs_1], 'epochs')
+    path = tmp_path / 'epochs'
+
+    _save_epochs(path, epochs)
+    loaded = _load_epochs(path, _epochs_artifact_metadata(epochs))
+
+    assert isinstance(loaded, Datalist)
+    assert loaded[0].times[[0, -1]] == pytest.approx(epochs_0.times[[0, -1]])
+    assert loaded[1].times[[0, -1]] == pytest.approx(epochs_1.times[[0, -1]])
 
 
 def test_assemble_epochs_requires_epoch_objects():

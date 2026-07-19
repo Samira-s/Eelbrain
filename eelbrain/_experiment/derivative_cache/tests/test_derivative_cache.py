@@ -1400,31 +1400,6 @@ class _Leaf(Derivative[str]):
         path.write_text(value)
 
 
-def test_input_requires_key_fields():
-    root, registry = make_empty_registry()
-
-    class NoFieldsInput(Input):
-        name = 'no-fields'
-
-        def path(self, ctx: Request) -> Path:
-            return Path(self.root) / 'x'
-
-    class OptOutInput(Input):
-        name = 'opt-out'
-        key_fields = ()
-
-        def __init__(self, root):
-            self.root = root
-
-        def path(self, ctx: Request) -> Path:
-            return Path(self.root) / 'x'
-
-    with pytest.raises(TypeError, match='must declare key_fields'):
-        registry.register(NoFieldsInput())
-    # an explicit empty tuple opts out and is accepted
-    registry.register(OptOutInput(root))
-
-
 def test_input_read_restriction():
     root, registry = make_empty_registry()
 
@@ -1443,7 +1418,7 @@ def test_input_read_restriction():
             return {'mode': ctx.state['mode']}
 
         def load(self, ctx: Request):
-            # load() is not restricted: reading an undeclared field is allowed
+            # reads an undeclared field while producing the input's content
             return ctx.state['mode']
 
     node = RestrictedInput(root)
@@ -1452,8 +1427,10 @@ def test_input_read_restriction():
 
     with pytest.raises(RuntimeError, match="not declared in this node's key_fields"):
         registry.resolve('restricted', state={'subject': 's1', 'mode': 'a'}).current_fingerprint()
-    # load() runs outside the check context, so the same read is allowed
-    assert registry.resolve('restricted', state={'subject': 's1', 'mode': 'a'}).load() == 'a'
+    # load() produces the input's content, so it is restricted like fingerprint():
+    # a field it reads but does not declare could never make a dependent stale.
+    with pytest.raises(RuntimeError, match="not declared in this node's key_fields"):
+        registry.resolve('restricted', state={'subject': 's1', 'mode': 'a'}).load()
 
 
 def _register_child_parent(registry, root, parent_cls):

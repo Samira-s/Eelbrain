@@ -1,3 +1,5 @@
+from dataclasses import dataclass, asdict
+from itertools import repeat
 from pathlib import Path
 import warnings
 
@@ -6,19 +8,48 @@ import mne
 from ... import load, save
 from ..._data_obj import Dataset, Datalist, Factor, NDVar, combine
 from ..._mne import morph_source_space
+from ..._ndvar import set_tmin
 from ..._ndvar.uts import pad
 from ..._utils.mne_utils import is_fake_mri
 from ..configuration import Configuration
 from ..data import DataSpec
 from ..derivative_cache import Dependency, Derivative, OptionSpec, Request, UncachedDerivative, VersionedInput, file_fingerprint
 from ..epochs.config import EpochCollection
-from ..pathing import MRI_SDIR, mri_dir
+from ..pathing import BIDS_ENTITY_KEYS, MRI_SDIR, mri_dir
 from ..preprocessing import RawFilter, RawPipe, RawSource
 from ..source.nodes import _subject_state
 from .estimator import Estimator
 from .job import TRFJob
-from .model import Model, Term, TRFModelError, parse_term
-from .predictor import EventPredictor, NUTSPredictor, UTSPredictor
+from .model import Model, Term, TRFModelError
+from .predictor import EventPredictor, NUTSPredictor, SubjectUTSPredictor, UTSPredictor
+
+
+@dataclass(frozen=True)
+class Recording:
+    """BIDS entities identifying one recording"""
+    subject: str
+    session: str
+    task: str
+    acquisition: str
+    run: str
+
+    def dependency_label(self, term: Term):
+        """Dependency label for a predictor file tied to this recording"""
+        suffix = f'task-{self.task}'
+        if self.run:
+            suffix += f'_run-{self.run}'
+        return f'{term.string}@{suffix}'
+
+
+def find_bids_recordings(ds: Dataset) -> list[Recording]:
+    """Move BIDS entities into dataset columns"""
+    values = []
+    for key in BIDS_ENTITY_KEYS:
+        if key in ds:
+            values.append(ds[key])
+        else:
+            values.append(repeat(ds.info[key], ds.n_cases))
+    return [Recording(*case) for case in zip(*values)]
 
 
 def filter_pipes(raw: dict[str, RawPipe], raw_name: str) -> list[RawFilter]:
@@ -71,12 +102,19 @@ def _post_process_trfs(
 class PredictorInput(VersionedInput[NDVar]):
     """Read the relevant data of a single predictor file
 
-    Reads one ``{stimulus}~{code}.pickle`` predictor file and returns the
-    subset of its contents that actually feeds the predictor (for a
-    :class:`NUTSPredictor`, only the ``time`` and value/mask columns; a
-    :class:`UTSPredictor` NDVar is returned unchanged). Shaping that data into
-    a predictor on the M/EEG time axis (resampling, NUTS conversion, padding)
-    is done by :class:`TRFDerivative`, which knows the response sampling rate.
+    Reads one predictor file and returns the subset of its contents that
+    actually feeds the predictor (for a :class:`NUTSPredictor`, only the
+    ``time`` and value/mask columns; a :class:`UTSPredictor` NDVar is returned
+    unchanged). Shaping that data into a predictor on the M/EEG time axis
+    (resampling, NUTS conversion, padding) is done by :class:`TRFDerivative`,
+    which knows the response sampling rate.
+
+    The predictor definition owns its file identity: a stimulus-based predictor
+    (:class:`UTSPredictor`, :class:`NUTSPredictor`) resolves to one file per
+    stimulus, keyed entirely by the ``term``. A
+    :class:`SubjectUTSPredictor` additionally uses the BIDS entities declared
+    by its ``_key_fields``; these depend on whether it represents a recording
+    sequence or per-event stimuli.
 
     Because the relevant data can be large, dependent manifests do not embed
     it; they store a small version identity backed by one canonical reference
@@ -93,9 +131,8 @@ class PredictorInput(VersionedInput[NDVar]):
         and the relevant columns.
     """
     name = 'predictor'
-    key_fields = ()  # identity is fully option-based (the predictor ``code``)
     key_options = {
-        'code': None,
+        'term': OptionSpec(None, Term, normalize=Term._coerce),
     }
 
     def __init__(
@@ -105,20 +142,27 @@ class PredictorInput(VersionedInput[NDVar]):
     ):
         self.root = Path(root)
         self.predictors = predictors
-        self.directory = self.root / 'derivatives' / 'predictors'
 
     def _resolve(self, ctx: Request) -> tuple[Term, UTSPredictor | NUTSPredictor]:
-        term = parse_term(ctx.options['code'])
+        term = ctx.options['term']
         predictor = self.predictors[term.predictor_key]
-        if not isinstance(predictor, (UTSPredictor, NUTSPredictor)):
+        if isinstance(predictor, SubjectUTSPredictor):
+            if term.stimulus and not predictor.per_event:
+                raise TRFModelError(f"{term.string}: {type(predictor).__name__}(per_event=False) cannot be combined with a stimulus")
+        elif not isinstance(predictor, (UTSPredictor, NUTSPredictor)):
             raise NotImplementedError(f"{term.string}: loading {type(predictor).__name__} is not supported")
         return term, predictor
 
+    def override_key_fields(self, ctx: Request) -> tuple[str, ...]:
+        term, predictor = self._resolve(ctx)
+        return predictor._key_fields
+
     def path(self, ctx: Request) -> Path:
         term, predictor = self._resolve(ctx)
-        return self.directory / f"{predictor._file_stem(term)}.pickle"
+        return predictor._path(term, ctx.state, self.root)
 
     def dependency_fingerprint_quick(self, ctx: Request, view: str | None = None) -> dict:
+        """Quickest comparison, avoiding reference .json read"""
         term, predictor = self._resolve(ctx)
         return {
             'config': predictor,
@@ -130,14 +174,9 @@ class PredictorInput(VersionedInput[NDVar]):
         return {'config': predictor, 'version': self.reference_version(ctx)}
 
     def _reference_stem(self, ctx: Request) -> str:
+        """Identifies the data relevant for this term"""
         term, predictor = self._resolve(ctx)
-        return predictor._reference_stem(term)
-
-    def _source_fingerprint(self, ctx: Request) -> dict:
-        return file_fingerprint(self.root, self.path(ctx))
-
-    def _current_data(self, ctx: Request):
-        return self.load(ctx)
+        return predictor._reference_stem(term, ctx.state)
 
     def _data_equal(self, ctx: Request, stored, current) -> bool:
         term, predictor = self._resolve(ctx)
@@ -196,9 +235,6 @@ class TRFDerivative(Derivative[object]):
         self.stim_var = stim_var
         self.raw = raw
 
-    def _estimator(self, ctx: Request) -> Estimator:
-        return self.estimators[ctx.options['estimator']]
-
     def _term_predictor(self, term: Term) -> tuple[Configuration, str]:
         """The ``(predictor_definition, stimulus_column)`` for a model term"""
         predictor = self.predictors[term.predictor_key]
@@ -210,19 +246,20 @@ class TRFDerivative(Derivative[object]):
         # This is also the read-enforcement set, so it must cover every state
         # field the build may read: 'inv' is always read (to pick the space).
         fields = ('subject', 'session', 'acquisition', 'raw', 'epoch', 'epoch_rejection', 'inv')
+        est = self.estimators[ctx.options['estimator']]
         if ctx.state['inv']:  # non-empty inverse → source space
             fields += ('cov', 'mrisubject', 'src', 'parc')
-        elif self._estimator(ctx).extra_inputs:  # NCRF: sensor data + forward solution
-            fields += ('cov', 'mrisubject', 'src')
+        if est.extra_input_fields:
+            fields += est.extra_input_fields
         else:
             fields += ('reference',)
         return tuple(fields)
 
     def fingerprint(self, ctx: Request) -> dict[str, object]:
-        return {'estimator': self._estimator(ctx)}
+        return {'estimator': self.estimators[ctx.options['estimator']]}
 
     def dependencies(self, ctx: Request) -> tuple[Dependency, ...]:
-        est = self._estimator(ctx)
+        est = self.estimators[ctx.options['estimator']]
 
         # M/EEG response: sensor (inv='') vs source space
         if ctx.state['inv']:  # source space
@@ -240,21 +277,38 @@ class TRFDerivative(Derivative[object]):
         for extra in est.extra_inputs:
             deps.append(Dependency(extra))
 
-        # one predictor-file edge per
+        # One predictor-file edge per input. Stimulus predictors, including
+        # per-event SubjectUTSPredictors, are shared across recordings;
+        # sequence-mode SubjectUTSPredictors have one edge per recording.
         edges: dict[str, Dependency] = {}
-        events = None
+        events = nested = recordings = None
         for term in ctx.options['x'].terms:
             predictor, stim_var = self._term_predictor(term)
-            if not isinstance(predictor, (UTSPredictor, NUTSPredictor)):
-                continue
+            if isinstance(predictor, EventPredictor):
+                continue  # EventPredictor generates from the events, no file edge
+            elif not isinstance(predictor, (UTSPredictor, NUTSPredictor)):
+                raise RuntimeError(f"{predictor=}")
+            # Lazy load events
             if events is None:
                 options = ctx.options_for('epoch-events', 'samplingrate', 'decim')
                 events = ctx.load('epoch-events', options=options)
-            if stim_var not in events:
+                nested = events.info.get('nested_events')
+            if isinstance(predictor, SubjectUTSPredictor) and not predictor.per_event:
+                if recordings is None:
+                    recordings = find_bids_recordings(events)
+                for recording in dict.fromkeys(recordings):  # ordered set
+                    label = recording.dependency_label(term)
+                    edges[label] = Dependency('predictor', label=label, state=asdict(recording), options={'term': term})
+                continue
+            elif nested:
+                stims = {stim for i in range(events.n_cases) for stim in events[i, nested][stim_var].cells}
+            elif stim_var in events:
+                stims = set(events[stim_var].cells)
+            else:
                 raise TRFModelError(f"{term.string}: stimulus variable {stim_var!r} not in the events")
-            for stim in events[stim_var].cells:
-                code = term.with_stimulus(stim).string
-                edges[code] = Dependency('predictor', label=code, options={'code': code})
+            for stim in stims:
+                stim_term = term.with_stimulus(stim)
+                edges[stim_term.string] = Dependency('predictor', label=stim_term.string, options={'term': stim_term})
         deps.extend(edges.values())
         return tuple(deps)
 
@@ -273,7 +327,7 @@ class TRFDerivative(Derivative[object]):
         # requires the build-deps context; it is re-entrant, so this is safe both
         # from build() (already inside it) and from TRFJobSpec.make_job() (fresh).
         with ctx._build_deps_context():
-            est = self._estimator(ctx)
+            est = self.estimators[ctx.options['estimator']]
             model = ctx.options['x']
             if not model.terms:
                 raise TRFModelError(f"{ctx.options['x']!r}: empty model")
@@ -290,27 +344,35 @@ class TRFDerivative(Derivative[object]):
                 cov = ctx.load('cov')
         return TRFJob(est, y, xs, tstart, tstop, fwd, cov, key=ctx.key())
 
-    def _load_predictor(self, ctx: Request, ds, term: Term, y) -> NDVar:
+    def _load_predictor(self, ctx: Request, ds, term: Term, y) -> NDVar | Datalist:
         "Assemble one model term's predictor, shaped to the response time axis"
         predictor, stim_var = self._term_predictor(term)
         is_variable_time = isinstance(y, Datalist)
+        is_nested = ds.info.get('nested_events')  # 'events' for a ContinuousEpoch
         filter_x = ctx.options['filter_x']
 
         if isinstance(predictor, EventPredictor):
             if filter_x:
                 raise ValueError(f"filter_x: not available for {type(predictor).__name__}")
+            if is_nested:
+                return Datalist([predictor._generate_continuous(yi.time, ds[i, is_nested], term) for i, yi in enumerate(y)])
             if is_variable_time:
                 raise NotImplementedError(f"{type(predictor).__name__} for variable-length epochs")
-            x = predictor._generate(y.time, ds, term)
-            x.name = term.string
-            return x
+            return predictor._generate(y.time, ds, term)
         elif not isinstance(predictor, (UTSPredictor, NUTSPredictor)):
             raise NotImplementedError(f"{term.string}: loading {type(predictor).__name__} is not supported")
 
-        # file predictor: build each stimulus' predictor from its file data at the
-        # response sampling rate, then align per case to the response
+        # per-subject sequence predictor: one recording-long file, cut per case
+        if isinstance(predictor, SubjectUTSPredictor) and not predictor.per_event:
+            return self._load_subject_predictor(ctx, predictor, term, ds, y, filter_x, is_nested)
+
         if stim_var not in ds:
             raise TRFModelError(f"{term.string}: stimulus variable {stim_var!r} not in the data")
+
+        if is_nested:
+            return self._load_predictor_nested(ctx, predictor, term, stim_var, ds, y, is_nested, filter_x)
+
+        # single-event epoch: one stimulus per case, aligned to the response
         stim_factor = ds[stim_var]
         if is_variable_time:
             xs = [self._aligned_predictor(ctx, predictor, term, s, yi.time, filter_x) for s, yi in zip(stim_factor, y)]
@@ -321,9 +383,58 @@ class TRFDerivative(Derivative[object]):
         x.name = term.string
         return x
 
-    def _aligned_predictor(self, ctx: Request, predictor: UTSPredictor | NUTSPredictor, term: Term, stim: str, time, filter_x: bool | str) -> NDVar:
+    def _load_predictor_nested(self, ctx: Request, predictor: UTSPredictor | NUTSPredictor, term: Term, stim_var: str, ds, y: Datalist, nested: str, filter_x: bool | str) -> Datalist:
+        "Assemble a per-event (ContinuousEpoch) predictor on the shared ``epoch_time`` axis"
+        tstep = y[0].time.tstep
+        stims = {stim for i in range(ds.n_cases) for stim in ds[i, nested][stim_var].cells}
+        cache = {stim: predictor._prepare_stimulus(ctx.load(term.with_stimulus(stim).string), tstep) for stim in stims}
+        xs = []
+        for i, yi in enumerate(y):
+            x = predictor._generate_continuous(yi.time, ds[i, nested], stim_var, term, cache)
+            x = filter_predictor(x, self.raw, ctx.state['raw'], filter_x)
+            x.name = term.string
+            xs.append(x)
+        return Datalist(xs)
+
+    def _load_subject_predictor(self, ctx: Request, predictor: SubjectUTSPredictor, term: Term, ds, y, filter_x: bool | str, is_nested: bool) -> NDVar | Datalist:
+        "Cut recording-long predictors into response cases"
+        times = [yi.time for yi in y] if isinstance(y, Datalist) else [y.time] * ds.n_cases
+        recordings = find_bids_recordings(ds)
+        x_fulls = {}
+        for recording in set(recordings):
+            label = recording.dependency_label(term)
+            x_full = predictor._prepare_sequence(ctx.load(label), times[0].tstep, term)
+            x_fulls[recording] = filter_predictor(x_full, self.raw, ctx.state['raw'], filter_x)
+
+        if is_nested:
+            offsets = [0.] * ds.n_cases
+        else:
+            sfreq = ds.info['raw.samplingrate']
+            sample_0 = {}
+            for recording, sample_i in zip(recordings, ds['sample']):
+                if recording not in sample_0:
+                    sample_0[recording] = sample_i
+            offsets = [(sample_i - sample_0[recording]) / sfreq for recording, sample_i in zip(recordings, ds['sample'])]
+
+        def chunk(time, recording, offset):
+            x_full = x_fulls[recording]
+            offset = x_full.time.tstep * round(offset / x_full.time.tstep)  # snap to the predictor's sample grid
+            x = set_tmin(x_full, x_full.time.tmin - offset) if offset else x_full  # global time offset -> local 0
+            x = pad(x, time.tmin, nsamples=time.nsamples, set_tmin=True)  # crop to the segment
+            x.name = term.string
+            return x
+
+        xs = [chunk(time, recording, offset) for time, recording, offset in zip(times, recordings, offsets)]
+        if isinstance(y, Datalist):
+            return Datalist(xs)
+        x = combine(xs)
+        x.name = term.string
+        return x
+
+    def _aligned_predictor(self, ctx: Request, predictor: UTSPredictor | NUTSPredictor, term: Term, stim: str | None, time, filter_x: bool | str) -> NDVar:
         "Build one stimulus' predictor from its file data and align it to ``time``"
-        subset = ctx.load(term.with_stimulus(stim).string)
+        stim_term = term.with_stimulus(stim)
+        subset = ctx.load(stim_term.string)
         x = predictor._generate(subset, None, time.tstep, None, term)
         x = filter_predictor(x, self.raw, ctx.state['raw'], filter_x)
         x = pad(x, time.tmin, nsamples=time.nsamples, set_tmin=True)
@@ -391,9 +502,6 @@ class TRFDatasetDerivative(UncachedDerivative[Dataset]):
             fields += ['cov', 'src', 'parc', 'adjacency', 'mrisubject', 'common_brain']
         return tuple(fields)
 
-    def _estimator(self, ctx: Request) -> Estimator:
-        return self.estimators[ctx.options['estimator']]
-
     def _epoch_names(self, ctx: Request) -> list[str]:
         epoch = self.epochs[ctx.state['epoch']]
         if isinstance(epoch, EpochCollection):
@@ -414,7 +522,7 @@ class TRFDatasetDerivative(UncachedDerivative[Dataset]):
         return tuple(deps)
 
     def build(self, ctx: Request) -> Dataset:
-        est = self._estimator(ctx)
+        est = self.estimators[ctx.options['estimator']]
         scale = ctx.options['scale']
         trfs = ctx.options['trfs']
         subject = ctx.state['subject']

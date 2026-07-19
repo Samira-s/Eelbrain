@@ -87,6 +87,7 @@ class EpochBase(Configuration):
     trigger_shift = None
     post_baseline_trigger_shift = None
     decim = None
+    run = None  # a specific run to restrict to; None aggregates all runs (overridden by PrimaryEpoch)
     _rej_file_epochs_from_name = False
     _needs_task: bool = False
     _tasks = None  # set if tasks is not (task,)
@@ -574,6 +575,9 @@ class ContinuousEpoch(EpochBase):
 
     When using :meth:`Pipeline.load_epochs`, each row of the returned
     :class:`Dataset` will contain the events in the epoch alongside the data.
+    Within each recording, all segments share an ``epoch_time`` coordinate
+    whose zero is the first selected event; later segments retain their
+    position on that recording's clock.
 
     Parameters
     ----------
@@ -597,8 +601,11 @@ class ContinuousEpoch(EpochBase):
         Target samplingrate. Needs to divide data samplingrate evenly (e.g.
         ``200`` for data sampled at 1000 Hz; by default, use the raw data
         samplingrate).
+    run
+        Restrict the epoch to a specific run. By default (``None``), events are
+        combined across all available runs for the given task.
     """
-    DICT_ATTRS = ('task', 'sel', 'pad_start', 'pad_end', 'split', 'samplingrate')
+    DICT_ATTRS = ('task', 'sel', 'pad_start', 'pad_end', 'split', 'samplingrate', 'run')
     _rej_file_epochs_from_name = True
     _needs_task = True
 
@@ -610,6 +617,7 @@ class ContinuousEpoch(EpochBase):
             pad_end: float = 1.000,
             split: float = 10,
             samplingrate: float = None,
+            run: str | None = None,
     ):
         self.task = typed_arg(task, str)
         self.sel = typed_arg(sel, str)
@@ -617,6 +625,7 @@ class ContinuousEpoch(EpochBase):
         self.pad_end = typed_arg(pad_end, float)
         self.split = typed_arg(split, float)
         self.samplingrate = typed_arg(samplingrate, float, int)
+        self.run = typed_arg(run, str)
 
     def _prepare_selected_events(
             self,
@@ -628,18 +637,16 @@ class ContinuousEpoch(EpochBase):
 
         split_threshold = self.split + self.pad_start + self.pad_end
         onsets = np.flatnonzero(ds['onset'].diff(to_begin=split_threshold + 1) >= split_threshold)
-        illegal = {'T_relative', 'events', 'tmax'}.intersection(ds)
+        illegal = {'epoch_time', 'events', 'tmax'}.intersection(ds)
         if illegal:
             raise RuntimeError(f"Events contain variables with reserved names: {', '.join(illegal)}")
-        events = [ds[i1:i2] for i1, i2 in zip(onsets, [*onsets[1:], None])]
         raw_samplingrate = ds.info['raw.samplingrate']
-        for events_i in events:
-            sample_i = events_i['sample'] - events_i[0, 'sample']
-            events_i['T_relative'] = sample_i / raw_samplingrate
+        ds['epoch_time'] = (ds['sample'] - ds[0, 'sample']) / raw_samplingrate
+        events = [ds[i1:i2] for i1, i2 in zip(onsets, [*onsets[1:], None])]
         ds = ds[onsets]
         ds.info['nested_events'] = 'events'
         ds['events'] = events
-        ds['tmax'] = Var([events_i[-1, 'onset'] - events_i[0, 'onset'] + self.pad_end for events_i in events])
+        ds['tmax'] = Var([events_i[-1, 'epoch_time'] - events_i[0, 'epoch_time'] + self.pad_end for events_i in events])
         return ds
 
     def _extraction_parameters(
@@ -692,8 +699,9 @@ def single_recording_run(epochs: Mapping[str, EpochBase], epoch: EpochBase) -> s
     Used to pin the ``run`` of a per-recording dependency when an aggregating
     node (``epochs``/``epoch-events``) is not combining across multiple runs, so
     the pinned value comes from the epoch definition rather than ambient state.
-    Returns the :class:`PrimaryEpoch` ``run`` (following ``SecondaryEpoch``
-    bases), or ``''`` when the experiment has no run entity.
+    Returns the primary/continuous epoch's ``run`` (following
+    :class:`SecondaryEpoch` bases), or ``''`` when the experiment has no run
+    entity.
 
     Parameters
     ----------
